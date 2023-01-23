@@ -13,7 +13,8 @@ import torch.distributed as dist
 
 from .utils import shift_dim, adopt_weight, comp_getattr
 from .modules import LPIPS, Codebook
-
+from einops import rearrange
+from py360convert import c2e as cube2equi
 def silu(x):
     return x*torch.sigmoid(x)
 
@@ -175,9 +176,37 @@ class VQGAN(pl.LightningModule):
 
         perceptual_loss = self.perceptual_model(frames, frames_recon) * self.perceptual_weight
         return recon_loss, x_recon, vq_output, perceptual_loss
+    
+
+    def get_input(self, batch):
+        cubes, rots, pos = batch 
+
+        x = list() 
+        poss = list() 
+        for k, v in cubes.items():
+            x.append(v)
+            poss.append(pos[k])
+        
+        x = torch.stack(x, dim=-1) # b c t h w n
+        poss = torch.stack(poss, dim=-1) # b c h w n
+        
+        x = rearrange(x, 'b c t h w n -> b c t n h w').contiguous()
+        poss = rearrange(poss, 'b c h w n -> b n c h w').contiguous()
+
+
+        poss_lon = torch.sin(poss[:, :, 0])
+        poss_lat = torch.cos(torch.abs(poss[:, :, 1]))
+        poss = torch.stack([poss_lon, poss_lat], dim=2)
+
+        x = x.float()
+        poss = poss.float()
+        
+        return x.contiguous(), poss.contiguous(), cubes.keys(), rots
+
 
     def training_step(self, batch, batch_idx, optimizer_idx):
-        x = batch['video']
+        x, _, _, _ = self.get_input(batch)
+        x = rearrange(x, 'b c t n h w -> (b n) c t h w')
         if optimizer_idx == 0:
             recon_loss, _, vq_output, aeloss, perceptual_loss, gan_feat_loss = self.forward(x, optimizer_idx)
             commitment_loss = vq_output['commitment_loss']
@@ -188,7 +217,8 @@ class VQGAN(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        x = batch['video'] # TODO: batch['stft']
+        x, _, _, _ = self.get_input(batch)
+        x = rearrange(x, 'b c t n h w -> (b n) c t h w')
         recon_loss, _, vq_output, perceptual_loss = self.forward(x)
         self.log('val/recon_loss', recon_loss, prog_bar=True)
         self.log('val/perceptual_loss', perceptual_loss, prog_bar=True)
@@ -208,14 +238,55 @@ class VQGAN(pl.LightningModule):
                                     list(self.video_discriminator.parameters()),
                                     lr=self.args.lr, betas=(0.5, 0.9))
         return [opt_ae, opt_disc], []
+    
+
+    @torch.no_grad()
+    def stich_cube(self, keys, rots, cubes):
+        cubes = (cubes + 1.) / 2.
+        
+        equi = list() 
+        b, n, c, h, w = cubes.shape
+        
+        for i in range(b):
+            cube_dict = dict() 
+            for k, v in zip(keys, cubes[i]):
+                if k == 'B' or k == 'R':
+                    v = torch.flip(v, [-1])
+                if k == 'U':
+                    v = torch.flip(v, [1])
+                
+                cube_dict[k] = v.permute(1, 2, 0).cpu().detach().numpy()
+           
+
+            equi.append(torch.from_numpy(cube2equi(cube_dict, cube_format='dict', h=self.equi_height, w=self.equi_width,)))
+        equi = torch.stack(equi, dim=0).unsqueeze(dim=1)
+        equi = rearrange(equi, 'b n h w c -> b n c h w')
+        equi = (equi * 2.) - 1.
+        return equi
+    
+    @torch.no_grad()
+    def stich_videocube(self, video, keys, rots):
+        video = rearrange(video, 'b c t n h w -> t b n c h w')
+        equi_video = list() 
+        for v_cube in video:
+            equi_video.append(self.stich_cube(keys, rots, v_cube).squeeze(dim=1))
+        equi_video = torch.stack(equi_video, dim=1)
+        return equi_video
 
     def log_images(self, batch, **kwargs):
         log = dict()
-        x = batch['video']
+        x, _, keys, rots = self.get_input(batch)
+        b, c, t, n, h, w = x.shape
+        x = rearrange(x, 'b c t n h w -> (b n) c t h w')
         x = x.to(self.device)
-        frames, frames_rec, _, _ = self(x, log_image=True)
-        log["inputs"] = frames
-        log["reconstructions"] = frames_rec
+        _, _, x, rec = self(x, log_image=True)
+        x = rearrange(x, '(b n) c t h w -> b c t n h w',b=b, n=n)
+        rec = rearrange(rec, '(b n) c t h w -> b c t n h w',b=b, n=n)
+        x = self.stich_videocube(x, keys, rots)
+        rec = self.stich_videocube(rec, keys, rots)
+        print(x.shape, rec.shape)
+        log["inputs"] = x
+        log["reconstructions"] = rec
         return log
 
     def log_videos(self, batch, **kwargs):
