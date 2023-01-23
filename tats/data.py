@@ -6,23 +6,404 @@ import math
 import random
 import pickle
 import warnings
-
+from pathlib import Path
 import glob
 import h5py
 import argparse
 import numpy as np
 from PIL import Image
-
+import torchvision.transforms as T
+from equilib import equi2cube
 import torch
 import torch.utils.data as data
 import torch.nn.functional as F
 import torch.distributed as dist
 from torchvision.datasets.video_utils import VideoClips
 import pytorch_lightning as pl
-
+from collections import defaultdict
 from .coinrun.coinrun_data import CoinRunDataset
 from .coinrun.tokenizer import tokenizer
 # from transformers import BertTokenizer
+from typing import Optional, List, Dict
+import importlib
+
+def get_obj_from_str(string:str, reload:bool=False):
+    module, cls = string.rsplit(".", 1)
+    if reload:
+        module_imp = importlib.import_module(module)
+        importlib.reload(module_imp)
+    return getattr(importlib.import_module(module, package=None), cls)
+
+def instantiate_from_config(config:dict):
+    if not "target" in config:
+        raise KeyError("Expected key `target` to instantiate.")
+
+    return get_obj_from_str(config["target"])(**config.get("params", dict()))
+
+
+class DataModuleFromConfig(pl.LightningDataModule):
+    def __init__(self, batch_size, train=None, validation=None, test=None,
+                 wrap=False, num_workers=None):
+        super().__init__()
+        self.batch_size = batch_size
+        self.dataset_configs = dict()
+        self.num_workers = num_workers if num_workers is not None else batch_size*2
+        if train is not None:
+            self.dataset_configs["train"] = train
+            self.train_dataloader = self._train_dataloader
+        if validation is not None:
+            self.dataset_configs["validation"] = validation
+            self.val_dataloader = self._val_dataloader
+        if test is not None:
+            self.dataset_configs["test"] = test
+            self.test_dataloader = self._test_dataloader
+        self.wrap = wrap
+
+    def prepare_data(self):
+        for data_cfg in self.dataset_configs.values():
+            instantiate_from_config(data_cfg)
+
+    def setup(self, stage=None):
+        self.datasets = dict(
+            (k, instantiate_from_config(self.dataset_configs[k]))
+            for k in self.dataset_configs)
+        
+
+    def _train_dataloader(self):
+        return data.DataLoader(self.datasets["train"], batch_size=self.batch_size,
+                          num_workers=self.num_workers, shuffle=True, pin_memory=True)
+
+    def _val_dataloader(self):
+        return data.DataLoader(self.datasets["validation"],
+                          batch_size=self.batch_size,
+                          num_workers=self.num_workers, shuffle=False, pin_memory=True)
+
+    def _test_dataloader(self):
+        return data.DataLoader(self.datasets["test"], batch_size=self.batch_size,
+                          num_workers=self.num_workers, pin_memory=True)
+
+
+def create_xyz_grid(
+    w_face: int,
+    batch: Optional[int] = None,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device = torch.device("cpu"),
+) -> torch.Tensor:
+    """xyz coordinates of the faces of the cube"""
+    out = torch.zeros((w_face, w_face * 6, 3), dtype=dtype, device=device)
+    rng = torch.linspace(-0.5, 0.5, w_face, dtype=dtype, device=device)
+
+    # NOTE: https://github.com/pytorch/pytorch/issues/15301
+    # Torch meshgrid behaves differently than numpy
+
+    # Front face (x = 0.5)
+    out[:, 0 * w_face : 1 * w_face, [2, 1]] = torch.stack(
+        torch.meshgrid([-rng, rng]), -1
+    )
+    out[:, 0 * w_face : 1 * w_face, 0] = 0.5
+
+    # Right face (y = -0.5)
+    out[:, 1 * w_face : 2 * w_face, [2, 0]] = torch.stack(
+        torch.meshgrid([-rng, -rng]), -1
+    )
+    out[:, 1 * w_face : 2 * w_face, 1] = 0.5
+
+    # Back face (x = -0.5)
+    out[:, 2 * w_face : 3 * w_face, [2, 1]] = torch.stack(
+        torch.meshgrid([-rng, -rng]), -1
+    )
+    out[:, 2 * w_face : 3 * w_face, 0] = -0.5
+
+    # Left face (y = 0.5)
+    out[:, 3 * w_face : 4 * w_face, [2, 0]] = torch.stack(
+        torch.meshgrid([-rng, rng]), -1
+    )
+    out[:, 3 * w_face : 4 * w_face, 1] = -0.5
+
+    # Up face (z = 0.5)
+    out[:, 4 * w_face : 5 * w_face, [0, 1]] = torch.stack(
+        torch.meshgrid([rng, rng]), -1
+    )
+    out[:, 4 * w_face : 5 * w_face, 2] = 0.5
+
+    # Down face (z = -0.5)
+    out[:, 5 * w_face : 6 * w_face, [0, 1]] = torch.stack(
+        torch.meshgrid([-rng, rng]), -1
+    )
+    out[:, 5 * w_face : 6 * w_face, 2] = -0.5
+
+    if batch is not None:
+        assert isinstance(
+            batch, int
+        ), f"ERR: batch needs to be integer: batch={batch}"
+        assert (
+            batch > 0
+        ), f"ERR: batch size needs to be larger than 0: batch={batch}"
+        # FIXME: faster way of copying?
+        out = torch.cat([out.unsqueeze(0)] * batch)
+        # grid shape is (b, h, w, 3)
+
+    return out
+
+def create_rotation_matrices(
+    rots: List[Dict[str, float]],
+    z_down: bool = True,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device = torch.device("cpu"),
+) -> torch.Tensor:
+    """Create rotation matrices from batch of rotations
+
+    This methods creates a bx3x3 np.ndarray where `b` referes to the number
+    of rotations (rots) given in the input
+    """
+
+    R = torch.empty((len(rots), 3, 3), dtype=dtype, device=device)
+    for i, rot in enumerate(rots):
+        # FIXME: maybe default to `create_rotation_matrix_at_once`?
+        # NOTE: at_once is faster with cpu, while slower on GPU
+        R[i, ...] = create_rotation_matrix(
+            **rot, z_down=z_down, dtype=dtype, device=device
+        )
+
+    return R
+
+def create_rotation_matrix(
+    roll: float,
+    pitch: float,
+    yaw: float,
+    z_down: bool = True,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device = torch.device("cpu"),
+) -> torch.Tensor:
+    """Create Rotation Matrix
+
+    params:
+    - roll, pitch, yaw (float): in radians
+    - z_down (bool): flips pitch and yaw directions
+    - dtype (torch.dtype): data types
+
+    returns:
+    - R (torch.Tensor): 3x3 rotation matrix
+    """
+
+    # calculate rotation about the x-axis
+    R_x = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, np.cos(roll), -np.sin(roll)],
+            [0.0, np.sin(roll), np.cos(roll)],
+        ],
+        dtype=dtype,
+    )
+    # calculate rotation about the y-axis
+    if not z_down:
+        pitch = -pitch
+    R_y = torch.tensor(
+        [
+            [np.cos(pitch), 0.0, np.sin(pitch)],
+            [0.0, 1.0, 0.0],
+            [-np.sin(pitch), 0.0, np.cos(pitch)],
+        ],
+        dtype=dtype,
+    )
+    # calculate rotation about the z-axis
+    if not z_down:
+        yaw = -yaw
+    R_z = torch.tensor(
+        [
+            [np.cos(yaw), -np.sin(yaw), 0.0],
+            [np.sin(yaw), np.cos(yaw), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=dtype,
+    )
+    R = R_z @ R_y @ R_x
+    return R.to(device)
+
+
+def random_rot(vertical_angle: int=180, horizontal_angle: int=360):
+    rots = {
+        'roll': 0.,
+        'pitch': np.radians(random.randint(0, vertical_angle)),
+        'yaw': np.radians(random.randint(0, horizontal_angle))
+    }
+
+    return rots
+
+
+def get_pixel_angles(cube_size, z_down, rots):        
+
+    # return logitude and latitude in radians
+
+    xyz = create_xyz_grid(w_face=cube_size, batch=1, dtype=torch.float32) 
+    xyz = xyz.unsqueeze(-1)
+
+    z_down = not z_down
+    R = create_rotation_matrices([rots], z_down)
+
+    xyz = torch.matmul(R[:, None, None, ...], xyz)
+    xyz = xyz.squeeze(-1)
+    phi = torch.asin(xyz[..., 2] / torch.norm(xyz, dim=-1))
+    theta = torch.atan2(xyz[..., 1], xyz[..., 0])
+    pos = torch.stack([phi, theta], dim=-1).squeeze(dim=0)
+    return pos
+
+
+def get_pos(cube_size, z_down, rots):
+
+        xyz = create_xyz_grid(w_face=cube_size, batch=1, dtype=torch.float32) 
+
+        xyz = xyz.unsqueeze(-1)
+
+        z_down = not z_down
+        R = create_rotation_matrices([rots], z_down)
+
+        xyz = torch.matmul(R[:, None, None, ...], xyz)
+        xyz = xyz.squeeze(-1)
+        phi = torch.asin(xyz[..., 2] / torch.norm(xyz, dim=-1))
+        theta = torch.atan2(xyz[..., 1], xyz[..., 0])
+        pos = torch.stack([phi, theta], dim=-1).squeeze(dim=0)
+
+        cube_list = list(torch.split(pos, split_size_or_sections=pos.shape[0], dim=-2))
+        cube_dict = dict()
+        k = ["F", "R", "B", "L", "U", "D"]
+        for ke, cube in zip(k, cube_list):
+            cube_dict[ke] = cube.permute(-1, 0, 1) # / torch.pi
+        
+        return cube_dict
+
+
+
+
+class VideoDataset(data.Dataset):
+    def __init__(self, folder, image_width, image_height, 
+                clip_size, cube_size, skip_frame=1, exts=['png', 'jpg'],):
+        super().__init__()
+        self.paths = dict()
+        for video in os.listdir(folder):
+            frames = [p for ext in exts for p in Path(f'{folder}/{video}').glob(f'*.{ext}')]
+            if len(frames) >= clip_size:
+                self.paths[video] = frames
+        self.clip_size = clip_size
+        self.cube_size = cube_size
+        self.skip_frame = skip_frame
+
+
+        self.transfomer = T.Compose([
+            T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+            T.Resize([image_height, image_width]),
+            T.ToTensor()
+        ])
+
+
+    
+    def __getitem__(self, index):
+        key = list(self.paths.keys())[index]
+        frames = self.paths[key]
+
+        start = random.randint(0, len(frames)-self.clip_size)
+
+        clip = frames[start:start+self.clip_size]
+        assert len(clip) == self.clip_size
+
+        imgs = [self.transfomer(Image.open(img)) for img in clip]
+
+        rots = random_rot(vertical_angle=0, horizontal_angle=360)
+        pos = get_pos(self.cube_size, False, rots)
+
+        imgs = torch.stack(imgs, dim=0) # b c h w
+        cubes = equi2cube(imgs, [rots]*self.clip_size, w_face=self.cube_size, cube_format='dict', z_down=False)
+
+        video_cubes = defaultdict(list)
+
+        for cube in cubes:
+            for k, v in cube.items():
+                video_cubes[k].append(v)
+        
+        cubes = dict()
+        for k, v in video_cubes.items():
+            cubes[k] = (torch.stack(v, dim=1) * 2. ) - 1. # c t h w
+
+        return cubes, rots, pos
+
+    
+    def __len__(self,):
+        return len(self.paths.keys())
+
+
+
+
+ 
+
+
+class ImageDatasetCustom(data.Dataset):
+    def __init__(self, folders, image_width, image_height, cube_size, folders_size=None, exts=['png']):
+        super().__init__()
+
+        if not isinstance(folders, list):
+            folders = list(folders) 
+
+        if not isinstance(exts, list):
+            exts = list(exts)
+        
+        
+        if folders_size is None:
+            folders_size = [-1 for _ in range(len(folders))]
+        else:
+            folders_size = list(folders_size)
+        
+        self.paths = list()
+        for folder, folder_size in zip(folders, folders_size):
+            images = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
+            random.shuffle(images)
+            print(f'from {folder} import {len(images[:folder_size])} images')
+            self.paths += images[:folder_size]
+        
+        self.transfomer = T.Compose([
+            T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+            T.Resize([image_height, image_width]),
+            T.ToTensor()
+        ])
+
+        
+        self.cube_size = cube_size
+
+
+    def __len__(self):
+        return len(self.paths)
+    
+    
+    
+    
+
+   
+
+    def __getitem__(self, idx):
+        path = self.paths[idx]    
+        img = Image.open(path)
+        img = self.transfomer(img) # c h w
+        # rots = self.get_rots()
+        rots = random_rot(vertical_angle=0, horizontal_angle=360)
+
+
+        cubes = equi2cube(img, rots, 
+                          w_face=self.cube_size, 
+                          cube_format='dict',
+                          z_down=False)
+        
+        pos = get_pos(self.cube_size, False, rots)
+
+        std_cubes = dict()
+        for k, v in cubes.items():
+            std_cubes[k] = (v * 2.) - 1.
+    
+        
+       
+        
+        
+        return std_cubes, rots, pos
+    
+
 
 
 class VideoDataset(data.Dataset):

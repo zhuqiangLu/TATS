@@ -4,7 +4,7 @@ import os
 import argparse
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
-from tats import VQGAN, VideoData
+from tats import VQGAN, VideoData, DataModuleFromConfig
 from tats.modules.callbacks import ImageLogger, VideoLogger
 
 def main():
@@ -13,13 +13,48 @@ def main():
     parser = argparse.ArgumentParser()
     parser = pl.Trainer.add_argparse_args(parser)
     parser = VQGAN.add_model_specific_args(parser)
-    parser = VideoData.add_data_specific_args(parser)
-    args = parser.parse_args()
+    # parser = VideoData.add_data_specific_args(parser)
+    args = parser.parse_args('/root/autodl-tmp/')
 
-    data = VideoData(args)
+    # data = VideoData(args)
+
+    train_data_config = {
+        'target': 'tats.VideoDataset',
+        'params':
+            {
+                'folder': '/root/autodl-tmp/train_split_frame',
+                'image_width': 480,
+                'image_height': 272,
+                'cube_size': 160,
+                'clip_size': 4,
+            }
+    }
+    val_data_config = {
+        'target': 'tats.VideoDataset',
+        'params':
+            {
+                'folder': '/root/autodl-tmp/test_split_frame',
+                'image_width': 480,
+                'image_height': 272,
+                'cube_size': 160,
+                'clip_size': 4,
+            }
+    }
+    
+
+
+    data = DataModuleFromConfig(
+        batch_size = 4,
+        train = train_data_config,
+        validation = val_data_config,
+        num_workers = 16,
+    )
+
     # pre-make relevant cached files if necessary
-    data.train_dataloader()
-    data.test_dataloader()
+    data.prepare_data()
+    # data.train_dataloader()
+    # data.test_dataloader()
+    
 
     # automatically adjust learning rate
     bs, base_lr, ngpu, accumulate = args.batch_size, args.lr, args.gpus, args.accumulate_grad_batches
