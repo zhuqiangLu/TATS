@@ -406,7 +406,7 @@ class ImageDatasetCustom(data.Dataset):
 
 
 
-class VideoDataset(data.Dataset):
+class VideoDataset2(data.Dataset):
     """ Generic dataset for videos files stored in folders
     Returns BCTHW videos in the range [-0.5, 0.5] """
     exts = ['avi', 'mp4', 'webm']

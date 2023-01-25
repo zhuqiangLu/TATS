@@ -44,6 +44,9 @@ class VQGAN(pl.LightningModule):
         self.embedding_dim = args.embedding_dim
         self.n_codes = args.n_codes
 
+        self.equi_height = 272
+        self.equi_width = 480
+
         if not hasattr(args, 'padding_type'):
             args.padding_type = 'replicate'
         self.encoder = Encoder(args.n_hiddens, args.downsample, args.image_channels, args.norm_type, args.padding_type)
@@ -174,7 +177,7 @@ class VQGAN(pl.LightningModule):
             self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
             return discloss
 
-        perceptual_loss = self.perceptual_model(frames, frames_recon) * self.perceptual_weight
+        perceptual_loss = self.perceptual_model(frames, frames_recon).mean() * self.perceptual_weight
         return recon_loss, x_recon, vq_output, perceptual_loss
     
 
@@ -273,7 +276,7 @@ class VQGAN(pl.LightningModule):
         equi_video = torch.stack(equi_video, dim=1)
         return equi_video
 
-    def log_images(self, batch, **kwargs):
+    def log_videos(self, batch, **kwargs):
         log = dict()
         x, _, keys, rots = self.get_input(batch)
         b, c, t, n, h, w = x.shape
@@ -283,20 +286,22 @@ class VQGAN(pl.LightningModule):
         x = rearrange(x, '(b n) c t h w -> b c t n h w',b=b, n=n)
         rec = rearrange(rec, '(b n) c t h w -> b c t n h w',b=b, n=n)
         x = self.stich_videocube(x, keys, rots)
+        x = rearrange(x, 'b t c h w -> b c t h w')
         rec = self.stich_videocube(rec, keys, rots)
+        rec = rearrange(rec, 'b t c h w -> b c t h w')
         print(x.shape, rec.shape)
         log["inputs"] = x
         log["reconstructions"] = rec
         return log
 
-    def log_videos(self, batch, **kwargs):
-        log = dict()
-        x = batch['video']
-        _, _, x, x_rec = self(x, log_image=True)
-        log["inputs"] = x
-        log["reconstructions"] = x_rec
-        return log
-
+#     def log_videos(self, batch, **kwargs):
+#         log = dict()
+#         x = batch['video']
+#         _, _, x, x_rec = self(x, log_image=True)
+#         log["inputs"] = x
+#         log["reconstructions"] = x_rec
+#         return log
+# 
     @staticmethod
     def add_model_specific_args(parent_parser):
         parser = argparse.ArgumentParser(parents=[parent_parser], add_help=False)
